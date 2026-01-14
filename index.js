@@ -1,29 +1,45 @@
+/**
+ * bridge-v0.1 — Railway-stabiler Core
+ * Ziel:
+ * - 1 Node-Prozess
+ * - klare API-Endpunkte
+ * - sauberes Static-Serving
+ * - keine Experimente, kein Build-Risiko
+ */
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-/**
- * Zentrale Nachrichtenlogik (Phase 2.5)
- * Hier wird später OpenAI / andere KI angebunden.
- */
-function handleMessage(message) {
-  if (!message || typeof message !== "string") {
-    return "Leere oder ungültige Nachricht empfangen.";
-  }
+const PORT = process.env.PORT || 8080;
+const PUBLIC_DIR = path.join(__dirname, "public");
 
-  return `Bridge hat verstanden: "${message}"`;
+/* ---------- Hilfsfunktionen ---------- */
+
+function sendJSON(res, statusCode, payload) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload));
 }
 
+function sendHTML(res, html) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+/* ---------- Server ---------- */
+
 const server = http.createServer((req, res) => {
-  // --- Status Endpoint ---
-  if (req.url === "/api/status") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "bridge online" }));
-    return;
+  /* --- Health / Status --- */
+  if (req.method === "GET" && req.url === "/api/status") {
+    return sendJSON(res, 200, {
+      status: "ok",
+      service: "bridge-v0.1",
+      time: new Date().toISOString()
+    });
   }
 
-  // --- Chat API Endpoint ---
-  if (req.url === "/api/chat" && req.method === "POST") {
+  /* --- Chat API --- */
+  if (req.method === "POST" && req.url === "/api/chat") {
     let body = "";
 
     req.on("data", chunk => {
@@ -32,38 +48,33 @@ const server = http.createServer((req, res) => {
 
     req.on("end", () => {
       try {
-        const data = JSON.parse(body);
-        const userMessage = data.message || "";
+        const data = JSON.parse(body || "{}");
+        const userMessage = String(data.message || "");
 
-        const reply = handleMessage(userMessage);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ reply }));
-      } catch (error) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Ungültige Anfrage" }));
+        return sendJSON(res, 200, {
+          reply: `Bridge empfangen: "${userMessage}"`,
+          source: "bridge-v0.1"
+        });
+      } catch (err) {
+        return sendJSON(res, 400, { error: "Invalid JSON" });
       }
     });
 
     return;
   }
 
-  // --- UI ausliefern ---
-  const filePath = path.join(__dirname, "public", "index.html");
-
+  /* --- UI (immer index.html) --- */
   try {
-    const html = fs.readFileSync(filePath, "utf8");
-    res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(html);
-  } catch (error) {
-    res.writeHead(500, { "Content-Type": "text/plain" });
-    res.end("UI konnte nicht geladen werden.");
+    const html = fs.readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+    return sendHTML(res, html);
+  } catch (err) {
+    res.writeHead(500);
+    res.end("UI not found");
   }
 });
 
-const PORT = process.env.PORT || 8080;
+/* ---------- Start ---------- */
 
 server.listen(PORT, () => {
-  console.log("Bridge läuft auf Port", PORT);
+  console.log(`[bridge-v0.1] running on port ${PORT}`);
 });
-``
