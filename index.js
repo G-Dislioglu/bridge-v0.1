@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const server = http.createServer((req, res) => {
   if (req.url === "/api/status") {
@@ -7,8 +9,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Hello Bridge");
+  const filePath = path.join(__dirname, "public", "index.html");
+  const html = fs.readFileSync(filePath, "utf8");
+  res.writeHead(200, { "Content-Type": "text/html" });
+  res.end(html);
 });
 
 const PORT = process.env.PORT || 8080;
