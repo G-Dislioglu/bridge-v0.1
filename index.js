@@ -33,6 +33,7 @@ const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 200_000); // 200KB
 
 // Public dir
 const PUBLIC_DIR = path.join(__dirname, "public");
+const PUBLIC_DIR_RESOLVED = path.resolve(PUBLIC_DIR);
 
 // ---------- Helpers ----------
 function sendJson(res, statusCode, obj) {
@@ -57,6 +58,14 @@ function setCors(res) {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+function setSecurityHeaders(res) {
+  // Ein paar einfache Security-Header
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  // CSP kann je nach App noch ergänzt werden
 }
 
 function getContentTypeByExt(ext) {
@@ -86,12 +95,24 @@ function getContentTypeByExt(ext) {
 }
 
 function safePublicPath(requestPath) {
-  // verhindert ../ traversal
-  const decoded = decodeURIComponent(requestPath);
-  const normalized = path.normalize(decoded).replace(/^(\.\.[/\\])+/, "");
-  const fullPath = path.join(PUBLIC_DIR, normalized);
-  if (!fullPath.startsWith(PUBLIC_DIR)) return null;
-  return fullPath;
+  // verhindert ../ traversal und absolute Pfade; gibt absoluten Pfad innerhalb PUBLIC_DIR zurück oder null
+  try {
+    const decoded = decodeURIComponent(requestPath || "");
+    // entferne führende Slashes, damit path.resolve PUBLIC_DIR nicht ignoriert
+    const relative = decoded.replace(/^[/\\]+/, "");
+    const fullPath = path.resolve(PUBLIC_DIR_RESOLVED, relative || ".");
+    // Erlaube exakt PUBLIC_DIR oder Unterpfade
+    if (
+      fullPath === PUBLIC_DIR_RESOLVED ||
+      fullPath.startsWith(PUBLIC_DIR_RESOLVED + path.sep)
+    ) {
+      return fullPath;
+    }
+    return null;
+  } catch {
+    // decodeURIComponent kann Fehler werfen bei ungültigen Encodings
+    return null;
+  }
 }
 
 function readRequestBody(req) {
@@ -103,7 +124,10 @@ function readRequestBody(req) {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
         reject(new Error("BODY_TOO_LARGE"));
-        req.destroy();
+        // abbrechen
+        try {
+          req.destroy();
+        } catch {}
         return;
       }
       body += chunk.toString("utf8");
@@ -128,8 +152,25 @@ function rateLimitOk(ip) {
   return cur.count <= RL_MAX_REQ;
 }
 
+// Optional: gelegentliche Aufräumung (nicht zwingend, aber sinnvoll bei lang laufendem Prozess)
+function cleanupRateLimiter() {
+  const now = Date.now();
+  for (const [k, v] of rlMap.entries()) {
+    if (now > v.resetAt + RL_WINDOW_MS * 5) {
+      rlMap.delete(k);
+    }
+  }
+}
+setInterval(cleanupRateLimiter, RL_WINDOW_MS * 5);
+
 // ---------- OpenAI call (Chat Completions via fetch) ----------
 async function openaiChat({ message, system }) {
+  if (typeof fetch !== "function") {
+    throw new Error(
+      "FETCH_NOT_AVAILABLE: global fetch is not verfügbar in diesem Node.js runtime. Verwende Node >=18 oder füge ein fetch-Polyfill hinzu."
+    );
+  }
+
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
 
@@ -167,9 +208,7 @@ async function openaiChat({ message, system }) {
     }
 
     const reply =
-      data?.choices?.[0]?.message?.content ??
-      data?.choices?.[0]?.text ??
-      "";
+      data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? "";
 
     return String(reply).trim();
   } finally {
@@ -181,6 +220,7 @@ async function openaiChat({ message, system }) {
 const server = http.createServer(async (req, res) => {
   try {
     setCors(res);
+    setSecurityHeaders(res);
 
     // Handle preflight
     if (req.method === "OPTIONS") {
@@ -192,14 +232,14 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = u.pathname || "/";
 
-    // IP for rate limit
+    // IP für rate limit (X-Forwarded-For beachten)
     const ip =
       (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
       req.socket.remoteAddress ||
       "unknown";
 
     // ---- API: status ----
-    if (pathname === "/api/status" && req.method === "GET") {
+    if (pathname === "/api/status" && (req.method === "GET" || req.method === "HEAD")) {
       sendJson(res, 200, {
         ok: true,
         status: "bridge online",
@@ -267,7 +307,7 @@ const server = http.createServer(async (req, res) => {
     // "/" -> index.html
     let filePath;
     if (pathname === "/" || pathname === "") {
-      filePath = path.join(PUBLIC_DIR, "index.html");
+      filePath = path.join(PUBLIC_DIR_RESOLVED, "index.html");
     } else {
       filePath = safePublicPath(pathname);
     }
@@ -278,24 +318,44 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Wenn Datei nicht existiert -> fallback index.html (für SPAs)
-    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-      const fallback = path.join(PUBLIC_DIR, "index.html");
+    let stat;
+    try {
+      stat = fs.existsSync(filePath) ? fs.statSync(filePath) : null;
+    } catch (e) {
+      // Falls stat fehlschlägt
+      stat = null;
+    }
+
+    if (!stat || stat.isDirectory()) {
+      const fallback = path.join(PUBLIC_DIR_RESOLVED, "index.html");
       if (!fs.existsSync(fallback)) {
         sendText(res, 404, "Not Found");
         return;
       }
-      const html = fs.readFileSync(fallback);
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(html);
+      // Stream fallback index.html
+      const stream = fs.createReadStream(fallback);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+      stream.pipe(res);
+      stream.on("error", () => {
+        try {
+          sendText(res, 500, "Internal Server Error");
+        } catch {}
+      });
       return;
     }
 
     const ext = path.extname(filePath).toLowerCase();
     const ct = getContentTypeByExt(ext);
-    const buf = fs.readFileSync(filePath);
 
+    // Stream statt kompletter Sync-Read
+    const rs = fs.createReadStream(filePath);
     res.writeHead(200, { "Content-Type": ct, "Cache-Control": "no-store" });
-    res.end(buf);
+    rs.pipe(res);
+    rs.on("error", () => {
+      try {
+        sendText(res, 500, "Internal Server Error");
+      } catch {}
+    });
   } catch (err) {
     // Hard fallback
     try {
