@@ -1,73 +1,108 @@
-// index.js (komplett ersetzen)
+/**
+ * bridge-v0.1 — Railway-stabiler Single-File Server
+ * - /api/status  -> JSON Status
+ * - /api/chat    -> Echo ODER OpenAI (wenn OPENAI_API_KEY gesetzt)
+ * - Static Hosting aus /public (inkl. index.html)
+ *
+ * Keine externen npm Dependencies nötig.
+ */
 
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
 
-const PORT = process.env.PORT || 8080;
+// ---------- Config ----------
+const PORT = Number(process.env.PORT || 8080);
 
-// Railway Variable: OPENAI_API_KEY
+// Optional OpenAI (ohne npm SDK, nur fetch)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // kann in Railway Variables geändert werden
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 25000);
 
-// Optional: Modell über Railway Variable setzen (z.B. "gpt-4o-mini")
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// Basic CORS (damit du später auch von anderen Apps callen kannst)
+const CORS_ALLOW_ORIGIN = process.env.CORS_ALLOW_ORIGIN || "*";
 
-// Optional aber empfohlen: schützt deinen Endpoint vor Missbrauch
-// Railway Variable: BRIDGE_TOKEN = irgend ein langes Passwort
-const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN || "";
+// Mini Rate Limit (schützt minimal gegen Missbrauch, in-memory)
+const RL_WINDOW_MS = Number(process.env.RL_WINDOW_MS || 60_000); // 60s
+const RL_MAX_REQ = Number(process.env.RL_MAX_REQ || 30); // 30 req/min pro IP
 
-// ------- Helpers -------
-function send(res, statusCode, headers, body) {
-  res.writeHead(statusCode, headers);
-  res.end(body);
+// Body Limit
+const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 200_000); // 200KB
+
+// Public dir
+const PUBLIC_DIR = path.join(__dirname, "public");
+
+// ---------- Helpers ----------
+function sendJson(res, statusCode, obj) {
+  const payload = JSON.stringify(obj);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(payload);
 }
 
-function sendJson(res, statusCode, obj, extraHeaders = {}) {
-  const body = JSON.stringify(obj);
-  send(
-    res,
-    statusCode,
-    {
-      "Content-Type": "application/json; charset=utf-8",
-      "Content-Length": Buffer.byteLength(body),
-      ...extraHeaders,
-    },
-    body
-  );
+function sendText(res, statusCode, text) {
+  res.writeHead(statusCode, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(text);
 }
 
-function sendText(res, statusCode, text, extraHeaders = {}) {
-  send(
-    res,
-    statusCode,
-    {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Length": Buffer.byteLength(text),
-      ...extraHeaders,
-    },
-    text
-  );
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function withCors(headers = {}) {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Bridge-Token",
-    ...headers,
-  };
+function getContentTypeByExt(ext) {
+  switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".svg":
+      return "image/svg+xml";
+    case ".ico":
+      return "image/x-icon";
+    case ".txt":
+      return "text/plain; charset=utf-8";
+    default:
+      return "application/octet-stream";
+  }
 }
 
-function readBody(req, maxBytes = 1_000_000) {
+function safePublicPath(requestPath) {
+  // verhindert ../ traversal
+  const decoded = decodeURIComponent(requestPath);
+  const normalized = path.normalize(decoded).replace(/^(\.\.[/\\])+/, "");
+  const fullPath = path.join(PUBLIC_DIR, normalized);
+  if (!fullPath.startsWith(PUBLIC_DIR)) return null;
+  return fullPath;
+}
+
+function readRequestBody(req) {
   return new Promise((resolve, reject) => {
+    let total = 0;
     let body = "";
-    let size = 0;
 
     req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size > maxBytes) {
-        reject(new Error("Body too large"));
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error("BODY_TOO_LARGE"));
         req.destroy();
         return;
       }
@@ -79,205 +114,206 @@ function readBody(req, maxBytes = 1_000_000) {
   });
 }
 
-function looksLikeSafePublicPath(p) {
-  // verhindert Path Traversal
-  if (!p || p.includes("..") || p.includes("\\") || p.includes("\0")) return false;
-  return true;
-}
+// ---------- Rate limiter ----------
+const rlMap = new Map(); // ip -> {count, resetAt}
 
-function contentTypeFor(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".html") return "text/html; charset=utf-8";
-  if (ext === ".js") return "application/javascript; charset=utf-8";
-  if (ext === ".css") return "text/css; charset=utf-8";
-  if (ext === ".json") return "application/json; charset=utf-8";
-  if (ext === ".png") return "image/png";
-  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
-  if (ext === ".svg") return "image/svg+xml; charset=utf-8";
-  return "application/octet-stream";
-}
-
-function requireBridgeToken(reqUrl, req) {
-  if (!BRIDGE_TOKEN) return true; // keine Prüfung aktiv
-  const headerToken = (req.headers["x-bridge-token"] || "").toString();
-  const urlToken = reqUrl.searchParams.get("token") || "";
-  return headerToken === BRIDGE_TOKEN || urlToken === BRIDGE_TOKEN;
-}
-
-async function callOpenAIChatCompletions({ message, system }) {
-  if (!OPENAI_API_KEY) {
-    return { ok: false, error: "OPENAI_API_KEY fehlt in Railway Variables." };
+function rateLimitOk(ip) {
+  const now = Date.now();
+  const cur = rlMap.get(ip);
+  if (!cur || now > cur.resetAt) {
+    rlMap.set(ip, { count: 1, resetAt: now + RL_WINDOW_MS });
+    return true;
   }
+  cur.count += 1;
+  return cur.count <= RL_MAX_REQ;
+}
 
-  const messages = [];
-  if (system && typeof system === "string" && system.trim()) {
-    messages.push({ role: "system", content: system.trim() });
-  } else {
-    messages.push({
-      role: "system",
-      content:
-        "Du bist eine hilfreiche Assistenz. Antworte kurz, klar und auf Deutsch.",
-    });
-  }
-  messages.push({ role: "user", content: String(message || "") });
-
+// ---------- OpenAI call (Chat Completions via fetch) ----------
+async function openaiChat({ message, system }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const t = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
 
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const payload = {
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      messages: [
+        ...(system ? [{ role: "system", content: String(system) }] : []),
+        { role: "user", content: String(message || "") },
+      ],
+    };
+
+    const r = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
       method: "POST",
-      signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
         "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(payload),
+      signal: controller.signal,
     });
 
-    const text = await resp.text();
-    let json;
+    const text = await r.text();
+    let data;
     try {
-      json = JSON.parse(text);
+      data = JSON.parse(text);
     } catch {
-      json = null;
+      data = null;
     }
 
-    if (!resp.ok) {
-      const detail =
-        (json && (json.error?.message || JSON.stringify(json))) || text || "";
-      return {
-        ok: false,
-        error: `OpenAI Fehler (${resp.status}): ${detail}`.slice(0, 1200),
-      };
+    if (!r.ok) {
+      const detail = data?.error?.message || text || `HTTP ${r.status}`;
+      throw new Error(`OPENAI_ERROR: ${detail}`);
     }
 
     const reply =
-      json?.choices?.[0]?.message?.content ??
-      "Keine Antwort erhalten (unerwartetes Format).";
+      data?.choices?.[0]?.message?.content ??
+      data?.choices?.[0]?.text ??
+      "";
 
-    return { ok: true, reply };
-  } catch (e) {
-    const msg =
-      e && e.name === "AbortError"
-        ? "Timeout: OpenAI hat zu lange gebraucht (30s)."
-        : `Netzwerk/Runtime Fehler: ${String(e?.message || e)}`;
-    return { ok: false, error: msg };
+    return String(reply).trim();
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(t);
   }
 }
 
-// ------- Server -------
+// ---------- Server ----------
 const server = http.createServer(async (req, res) => {
-  const base = `http://${req.headers.host || "localhost"}`;
-  const reqUrl = new URL(req.url || "/", base);
+  try {
+    setCors(res);
 
-  // CORS Preflight (für /api/*)
-  if (reqUrl.pathname.startsWith("/api/") && req.method === "OPTIONS") {
-    send(res, 204, withCors(), "");
-    return;
-  }
+    // Handle preflight
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
 
-  // --- API: Status ---
-  if (reqUrl.pathname === "/api/status" && req.method === "GET") {
-    sendJson(
-      res,
-      200,
-      {
+    const u = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const pathname = u.pathname || "/";
+
+    // IP for rate limit
+    const ip =
+      (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+      req.socket.remoteAddress ||
+      "unknown";
+
+    // ---- API: status ----
+    if (pathname === "/api/status" && req.method === "GET") {
+      sendJson(res, 200, {
+        ok: true,
         status: "bridge online",
+        uptime_s: Math.round(process.uptime()),
+        node: process.version,
+        has_openai_key: Boolean(OPENAI_API_KEY),
         model: OPENAI_MODEL,
         time: new Date().toISOString(),
-      },
-      withCors()
-    );
-    return;
-  }
-
-  // --- API: Chat ---
-  if (reqUrl.pathname === "/api/chat" && req.method === "POST") {
-    if (!requireBridgeToken(reqUrl, req)) {
-      sendJson(
-        res,
-        401,
-        { error: "Unauthorized (BRIDGE_TOKEN erforderlich)." },
-        withCors()
-      );
+      });
       return;
     }
 
-    let raw;
-    try {
-      raw = await readBody(req, 1_000_000);
-    } catch (e) {
-      sendJson(res, 413, { error: "Request zu groß." }, withCors());
+    // ---- API: chat ----
+    if (pathname === "/api/chat" && req.method === "POST") {
+      if (!rateLimitOk(ip)) {
+        sendJson(res, 429, { ok: false, error: "rate_limited" });
+        return;
+      }
+
+      let raw;
+      try {
+        raw = await readRequestBody(req);
+      } catch (e) {
+        if (String(e.message) === "BODY_TOO_LARGE") {
+          sendJson(res, 413, { ok: false, error: "body_too_large" });
+          return;
+        }
+        throw e;
+      }
+
+      let data;
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid_json" });
+        return;
+      }
+
+      const userMessage = (data.message || "").toString();
+      const system = (data.system || "").toString();
+
+      if (!userMessage.trim()) {
+        sendJson(res, 400, { ok: false, error: "missing_message" });
+        return;
+      }
+
+      // Wenn kein Key gesetzt ist -> Echo Mode (damit UI immer funktioniert)
+      if (!OPENAI_API_KEY) {
+        const reply = `Nachricht empfangen: "${userMessage}"`;
+        sendJson(res, 200, { ok: true, mode: "echo", reply });
+        return;
+      }
+
+      // OpenAI Mode
+      try {
+        const reply = await openaiChat({ message: userMessage, system });
+        sendJson(res, 200, { ok: true, mode: "openai", reply });
+      } catch (e) {
+        sendJson(res, 502, { ok: false, error: "openai_failed", detail: String(e.message || e) });
+      }
       return;
     }
 
-    let data;
+    // ---- Static files ----
+    // "/" -> index.html
+    let filePath;
+    if (pathname === "/" || pathname === "") {
+      filePath = path.join(PUBLIC_DIR, "index.html");
+    } else {
+      filePath = safePublicPath(pathname);
+    }
+
+    if (!filePath) {
+      sendText(res, 400, "Bad Request");
+      return;
+    }
+
+    // Wenn Datei nicht existiert -> fallback index.html (für SPAs)
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      const fallback = path.join(PUBLIC_DIR, "index.html");
+      if (!fs.existsSync(fallback)) {
+        sendText(res, 404, "Not Found");
+        return;
+      }
+      const html = fs.readFileSync(fallback);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+      return;
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    const ct = getContentTypeByExt(ext);
+    const buf = fs.readFileSync(filePath);
+
+    res.writeHead(200, { "Content-Type": ct, "Cache-Control": "no-store" });
+    res.end(buf);
+  } catch (err) {
+    // Hard fallback
     try {
-      data = JSON.parse(raw || "{}");
+      sendJson(res, 500, { ok: false, error: "server_error", detail: String(err.message || err) });
     } catch {
-      sendJson(res, 400, { error: "Ungültiges JSON." }, withCors());
-      return;
+      // ignore
     }
-
-    const userMessage = (data.message || "").toString();
-    const system = (data.system || "").toString();
-
-    if (!userMessage.trim()) {
-      sendJson(res, 400, { error: "message fehlt." }, withCors());
-      return;
-    }
-
-    const result = await callOpenAIChatCompletions({
-      message: userMessage,
-      system,
-    });
-
-    if (!result.ok) {
-      sendJson(res, 500, { error: result.error }, withCors());
-      return;
-    }
-
-    sendJson(res, 200, { reply: result.reply }, withCors());
-    return;
   }
-
-  // --- Static UI (public/) ---
-  // Wenn du später Dateien wie app.js/css einbaust, werden sie hier mit ausgeliefert.
-  const publicDir = path.join(__dirname, "public");
-
-  // Standard: "/" => index.html
-  let relPath = reqUrl.pathname === "/" ? "/index.html" : reqUrl.pathname;
-
-  if (!looksLikeSafePublicPath(relPath)) {
-    sendText(res, 400, "Bad Request");
-    return;
-  }
-
-  const absPath = path.join(publicDir, relPath);
-  if (absPath.startsWith(publicDir) && fs.existsSync(absPath) && fs.statSync(absPath).isFile()) {
-    const file = fs.readFileSync(absPath);
-    send(res, 200, { "Content-Type": contentTypeFor(absPath) }, file);
-    return;
-  }
-
-  // Fallback: immer index.html (SPA-Style)
-  const indexPath = path.join(publicDir, "index.html");
-  if (fs.existsSync(indexPath)) {
-    const html = fs.readFileSync(indexPath, "utf8");
-    send(res, 200, { "Content-Type": "text/html; charset=utf-8" }, html);
-    return;
-  }
-
-  sendText(res, 404, "Not Found");
 });
 
 server.listen(PORT, () => {
   console.log("Bridge läuft auf Port", PORT);
+});
+
+// Graceful shutdown (Railway)
+process.on("SIGTERM", () => {
+  server.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  server.close(() => process.exit(0));
 });
