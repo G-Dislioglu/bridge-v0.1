@@ -4,5 +4,8 @@
   "private": true,
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
   }
 }
