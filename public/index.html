@@ -14,45 +14,67 @@
       height: 100vh;
       margin: 0;
     }
+
     .chat {
-      width: 400px;
+      width: 420px;
       background: #1c1c25;
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 16px;
       display: flex;
       flex-direction: column;
+      box-shadow: 0 0 20px rgba(0,0,0,0.5);
     }
+
     .messages {
       flex: 1;
       overflow-y: auto;
-      margin-bottom: 10px;
+      margin-bottom: 12px;
       font-size: 14px;
+      padding-right: 4px;
     }
+
+    .msg {
+      margin-bottom: 8px;
+    }
+
+    .user {
+      color: #8ab4ff;
+    }
+
+    .bridge {
+      color: #a6ffb3;
+    }
+
     .input {
       display: flex;
+      gap: 6px;
     }
+
     input {
       flex: 1;
       padding: 8px;
       border-radius: 4px;
       border: none;
+      font-size: 14px;
     }
+
     button {
-      margin-left: 6px;
-      padding: 8px 12px;
+      padding: 8px 14px;
       border: none;
       border-radius: 4px;
       background: #6a5cff;
       color: white;
       cursor: pointer;
+      font-size: 14px;
     }
   </style>
 </head>
 <body>
   <div class="chat">
     <div class="messages" id="messages">
-      <div>Bridge bereit.</div>
+      <div class="msg bridge">Bridge: bereit.</div>
     </div>
+
     <div class="input">
       <input id="input" placeholder="Nachricht eingeben…" />
       <button onclick="send()">Senden</button>
@@ -63,15 +85,18 @@
     function send() {
       const input = document.getElementById("input");
       const messages = document.getElementById("messages");
-      if (!input.value) return;
 
-      const msg = document.createElement("div");
-      msg.textContent = "Du: " + input.value;
-      messages.appendChild(msg);
+      if (!input.value.trim()) return;
 
-      const reply = document.createElement("div");
-      reply.textContent = "Bridge: (noch ohne KI)";
-      messages.appendChild(reply);
+      const userMsg = document.createElement("div");
+      userMsg.className = "msg user";
+      userMsg.textContent = "Du: " + input.value;
+      messages.appendChild(userMsg);
+
+      const bridgeMsg = document.createElement("div");
+      bridgeMsg.className = "msg bridge";
+      bridgeMsg.textContent = "Bridge: (noch ohne KI)";
+      messages.appendChild(bridgeMsg);
 
       input.value = "";
       messages.scrollTop = messages.scrollHeight;
@@ -79,3 +104,4 @@
   </script>
 </body>
 </html>
+
