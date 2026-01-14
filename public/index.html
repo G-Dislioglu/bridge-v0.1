@@ -82,26 +82,41 @@
   </div>
 
   <script>
-    function send() {
-      const input = document.getElementById("input");
-      const messages = document.getElementById("messages");
+  async function send() {
+    const input = document.getElementById("input");
+    const messages = document.getElementById("messages");
 
-      if (!input.value.trim()) return;
+    const text = input.value.trim();
+    if (!text) return;
 
-      const userMsg = document.createElement("div");
-      userMsg.className = "msg user";
-      userMsg.textContent = "Du: " + input.value;
-      messages.appendChild(userMsg);
+    const userMsg = document.createElement("div");
+    userMsg.className = "msg user";
+    userMsg.textContent = "Du: " + text;
+    messages.appendChild(userMsg);
+
+    input.value = "";
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text })
+      });
+
+      const data = await res.json();
 
       const bridgeMsg = document.createElement("div");
       bridgeMsg.className = "msg bridge";
-      bridgeMsg.textContent = "Bridge: (noch ohne KI)";
+      bridgeMsg.textContent = "Bridge: " + data.reply;
       messages.appendChild(bridgeMsg);
-
-      input.value = "";
-      messages.scrollTop = messages.scrollHeight;
+    } catch (e) {
+      const err = document.createElement("div");
+      err.className = "msg bridge";
+      err.textContent = "Bridge: Fehler beim Antworten";
+      messages.appendChild(err);
     }
-  </script>
-</body>
-</html>
+
+    messages.scrollTop = messages.scrollHeight;
+  }
+</script>
 
